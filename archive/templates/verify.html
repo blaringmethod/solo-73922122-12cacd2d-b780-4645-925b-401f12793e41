@@ -20,6 +20,9 @@ const TYPE_CN = {
   catalog_pending: '目录未登记完成',
   receipt_signature_invalid: '回执验签失败',
   receipt_unavailable: '回执不可用',
+  cold_package_missing: '冷包缺失',
+  cold_package_damaged: '冷包损坏',
+  cold_undeclared_member: '冷包含未见证成员',
 };
 document.getElementById('runBtn').onclick = async () => {
   document.getElementById('summary').textContent = '核查中……';
@@ -40,12 +43,19 @@ document.getElementById('runBtn').onclick = async () => {
   let html = '';
   for (const b of data.batches) {
     html += `<h3 class="${b.passed ? 'ok' : 'bad'}">批次 ${b.batch_id}
-             （${b.passed ? '通过' : '存在问题'}）</h3>
-      <table><tr><th>文件</th><th>验签</th><th>本地原件</th>
-      <th>目录登记</th><th>问题</th></tr>`;
+             （${b.passed ? '通过' : '存在问题'}）</h3>`;
+    if (b.package_problems && b.package_problems.length) {
+      html += '<p class="bad">冷包异常（独立于残留热件，必须处置）：<ul>' +
+        b.package_problems.map(p =>
+          `<li><b>${TYPE_CN[p.type] || p.type}</b>：${p.detail || ''}</li>`
+        ).join('') + '</ul></p>';
+    }
+    html += `<table><tr><th>文件</th><th>验签</th><th>本地原件</th>
+      <th>位置</th><th>目录登记</th><th>问题</th></tr>`;
     for (const f of b.files) {
       const local = f.local.present
-        ? `${f.local.length} B<br><span class="mono">${f.local.sha256.slice(0,24)}…</span>`
+        ? `${f.local.length} B（${f.local.source === 'cold' ? '冷包' : '热件'}）<br>
+           <span class="mono">${f.local.sha256.slice(0,24)}…</span>`
         : '<span class="bad">缺失</span>';
       const problems = f.problems.length
         ? f.problems.map(p =>
@@ -57,6 +67,8 @@ document.getElementById('runBtn').onclick = async () => {
             ? '<span class="pill good">通过</span>'
             : '<span class="pill bad">失败</span>'}</td>
         <td>${local}</td>
+        <td>${f.storage === 'cold' ? 'cold 冷包'
+              : f.storage === 'hot' ? 'hot 热件' : '未知'}</td>
         <td>${f.catalogued ? '已登记' : '<span class="bad">漏登</span>'}</td>
         <td>${problems}</td></tr>`;
     }

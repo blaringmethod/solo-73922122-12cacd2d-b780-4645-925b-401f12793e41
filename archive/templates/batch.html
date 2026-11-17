@@ -4,15 +4,30 @@
 <div class="card">
   <h2>批次 <span class="mono">{{ batch_id }}</span></h2>
   <div class="row">
+    <button id="coldBtn">转冷（压缩为 ZIP 冷包）</button>
     <button class="secondary" id="reconcileBtn">接续待核文件</button>
     <button class="secondary" id="refreshBtn">刷新</button>
   </div>
+  <p class="muted">首次受理转冷时固定当前已登记文件名单；之后上传的文件仍按热件接收并保留，
+     重复转冷沿用原名单。冷包持久化并核验通过、取件位置切换后才删除热件，热件清净才报完成。</p>
+  <div id="coldBox" class="muted"></div>
   <div id="box"></div>
 </div>
 {% endblock %}
 {% block script %}
 <script>
 const batchId = {{ batch_id | tojson }};
+const COLD_STATE_CN = {
+  queued: '排队中', compressing: '压缩中', verifying: '核验中',
+  switching: '切换取件位置', cleaning: '清理热件',
+  completed: '转冷完成', failed: '失败',
+};
+function coldPill(job) {
+  if (!job) return '';
+  const cls = job.state === 'completed' ? 'complete'
+    : job.state === 'failed' ? 'bad' : 'pending';
+  return `<span class="pill ${cls}">${COLD_STATE_CN[job.state] || job.state}</span>`;
+}
 async function load() {
   const r = await fetch(`/api/batches/${encodeURIComponent(batchId)}`);
   const box = document.getElementById('box');
@@ -20,14 +35,28 @@ async function load() {
   const b = await r.json();
   const pill = b.status === 'complete' ? 'complete'
              : b.status === 'pending' ? 'pending' : 'incomplete';
+  // Cooling job progress / failure reason
+  const coldBox = document.getElementById('coldBox');
+  if (b.cold_job) {
+    const j = b.cold_job;
+    coldBox.innerHTML = `<p>转冷任务：${coldPill(j)}
+        进度 ${j.processed}/${j.total}
+        <span class="muted">（冻结名单：${j.manifest.map(m => m.filename).join('、') || '空'}）</span>
+        ${j.last_error ? `<br><span class="bad">失败原因：${j.last_error}</span>` : ''}</p>`;
+  } else {
+    coldBox.textContent = '';
+  }
   let html = `<p>整体状态：<span class="pill ${pill}">${b.status}</span>
-              （文件 ${b.file_count}，已登记 ${b.registered_count}）</p>
-    <table><tr><th>文件</th><th>长度</th><th>SHA-256</th><th>状态</th>
-    <th>回执/错误</th><th>下载</th></tr>`;
+              （文件 ${b.file_count}，已登记 ${b.registered_count}，冷件 ${b.cold_count}）</p>
+    <table><tr><th>文件</th><th>长度</th><th>SHA-256</th><th>状态</th><th>位置</th>
+    <th>回执/错误</th><th>下载原件</th></tr>`;
   for (const f of b.files) {
     const fpill = f.status === 'registered'
       ? '<span class="pill complete">registered</span>'
       : '<span class="pill pending">pending 待核</span>';
+    const loc = f.storage === 'cold'
+      ? '<span class="pill pending">cold 冷包</span>'
+      : '<span class="pill good">hot 热件</span>';
     const detail = f.status === 'registered'
       ? `<span class="mono">${f.receipt.algorithm} 签发于 ${f.receipt.issued_at}<br>
          sig=${f.receipt.signature.slice(0, 48)}…</span>`
@@ -37,7 +66,7 @@ async function load() {
            encodeURIComponent(f.filename)}">下载</a>`
       : '<span class="muted">未开放</span>';
     html += `<tr><td>${f.filename}</td><td>${f.length}</td>
-      <td class="mono">${f.sha256}</td><td>${fpill}</td>
+      <td class="mono">${f.sha256}</td><td>${fpill}</td><td>${loc}</td>
       <td>${detail}</td><td>${dl}</td></tr>`;
   }
   html += '</table>';
@@ -48,6 +77,19 @@ document.getElementById('reconcileBtn').onclick = async () => {
   const r = await fetch('/api/reconcile', { method: 'POST' });
   alert(JSON.stringify(await r.json(), null, 2));
   load();
+};
+document.getElementById('coldBtn').onclick = async () => {
+  const r = await fetch(`/api/batches/${encodeURIComponent(batchId)}/cold`,
+                        { method: 'POST' });
+  const data = await r.json();
+  if (!r.ok) {
+    alert('转冷受理失败：' + JSON.stringify(data, null, 2));
+  } else {
+    alert('已受理：' + JSON.stringify(data.job, null, 2));
+  }
+  load();
+  // Keep refreshing so progress and failure reasons are visible.
+  setTimeout(load, 1500);
 };
 load();
 </script>

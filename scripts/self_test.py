@@ -155,17 +155,25 @@ class Harness:
         return p
 
     def start_archive(self, port=PORT_A, witness_port=PORT_W,
-                      crash_marker: Path | None = None):
+                      crash_marker: Path | None = None,
+                      cold_crash_marker: Path | None = None,
+                      cold_step_sleep: str = ""):
         env = os.environ.copy()
         env.update({
             "ARCHIVE_DB": str(self.adata / f"archive-{port}.db"),
             "ARCHIVE_STORAGE": str(self.adata / f"originals-{port}"),
+            "ARCHIVE_COLD_DIR": str(self.adata / f"cold-{port}"),
             "ARCHIVE_PUBLIC_KEY":
                 str(self.keys / "witness_ed25519.pub.pem"),
             "WITNESS_URL": f"http://{HOST}:{witness_port}",
             "ARCHIVE_CRASH_MARKER": str(
                 crash_marker or (self.adata / f"crash-{port}.flag")),
+            "ARCHIVE_COLD_CRASH_MARKER": str(
+                cold_crash_marker
+                or (self.adata / f"cold-crash-{port}.flag")),
         })
+        if cold_step_sleep:
+            env["ARCHIVE_COLD_STEP_SLEEP"] = cold_step_sleep
         p = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "archive.main:app",
              "--host", HOST, "--port", str(port)],
@@ -447,6 +455,9 @@ def main() -> int:
                     for p in f["problems"]]
         check("verification detects catalog omission (目录漏登)",
               "catalog_missing" in problems)
+        # Restore the catalog row via reconciliation so later sections start
+        # from a clean state (the witness receipt + hot original still exist).
+        req("POST", PORT_A, "/api/reconcile")
 
         # 9d. a forged receipt (attacker's own Ed25519 key) must not verify
         # against the fixed public key pinned in the archiver.
@@ -477,6 +488,254 @@ def main() -> int:
         check("witness unreachable => verification 503, never passed",
               s == 503 and report["passed"] is False
               and report["witness_reachable"] is False)
+
+        # ================================================================= #
+        # 12. Cold storage (batch cooling)
+        # ================================================================= #
+        # Bring the witness back; all prior receipts remain on its volume.
+        h.start_witness()
+        check("witness back for cold-storage tests", wait_port(PORT_W))
+        s, report = req("GET", PORT_A, "/api/verify")
+        check("verification passes again after witness restart",
+              s == 200 and report["passed"] is True)
+
+        import zipfile as _zipfile
+        cold_root = h.adata / f"cold-{PORT_A}"
+        marker = h.adata / f"cold-crash-{PORT_A}.flag"
+
+        # Restart the archive on the same persistent volume with a small
+        # per-step cooling delay so blocking/concurrency is observable.
+        h.shutdown_port(PORT_A)
+        wait_down(PORT_A, 10)
+        h.start_archive(cold_step_sleep="0.15")
+        check("archive restarts with slow cooling knob", wait_port(PORT_A))
+
+        cb = "BATCH-COLD"
+        cold_files = {
+            "a.csv": b"alpha,1\nbeta,2\n",
+            "b.csv": b"gamma,3\ndelta,4\nepsilon,5\n",
+            "c.csv": b"zeta,6\n",
+        }
+        for name, data in cold_files.items():
+            s, r = upload(PORT_A, cb, name, data)
+            check(f"upload {name} for cooling", s == 200
+                  and r["result"] == "registered")
+
+        # 12.1 enqueue freezes the registered list and the worker runs.
+        s, r = req("POST", PORT_A, f"/api/batches/{cb}/cold")
+        check("cooling accepted, job queued with frozen manifest",
+              s == 200 and r["result"] == "queued"
+              and sorted(m["filename"] for m in r["job"]["manifest"])
+              == sorted(cold_files), f"http={s}")
+        # A second acceptance while active is rejected, not duplicated.
+        s2, r2 = req("POST", PORT_A, f"/api/batches/{cb}/cold")
+        check("duplicate cooling while active => 409 already_running",
+              s2 == 409 and r2["result"] == "already_running")
+
+        deadline = time.time() + 20
+        job = {}
+        while time.time() < deadline:
+            s, job = req("GET", PORT_A, f"/api/batches/{cb}/cold")
+            if job["job"]["state"] == "completed":
+                break
+            time.sleep(0.2)
+        check("cooling reaches completed",
+              job.get("job", {}).get("state") == "completed",
+              str(job.get("job", {}).get("state")))
+
+        # 12.2 hot originals removed only after the switch; package readable.
+        hot_dir = h.adata / f"originals-{PORT_A}" / cb
+        check("hot originals cleaned after completed cooling",
+              not hot_dir.exists() or not any(hot_dir.iterdir()))
+        pkg = cold_root / f"{cb}.zip"
+        check("cold package persisted in the archive volume", pkg.is_file())
+        with _zipfile.ZipFile(pkg) as zf:
+            check("package stores every frozen member (single-read ZIP)",
+                  sorted(zf.namelist()) == sorted(cold_files)
+                  and all(i.compress_type == _zipfile.ZIP_DEFLATED
+                          for i in zf.infolist()))
+            check("single-member random read returns exact bytes",
+                  all(zf.read(n) == d for n, d in cold_files.items()))
+
+        # 12.3 catalog flipped to cold; receipts unchanged; download works.
+        s, batch = req("GET", PORT_A, f"/api/batches/{cb}")
+        check("catalog marks members cold and batch still complete",
+              batch["status"] == "complete"
+              and batch["cold_count"] == len(cold_files)
+              and all(f["storage"] == "cold" for f in batch["files"]))
+        for name, data in cold_files.items():
+            s, dl = req("GET", PORT_A,
+                        f"/api/batches/{cb}/download/{name}")
+            check(f"cold download {name} byte-identical",
+                  s == 200 and dl == data)
+        s, wl = req("GET", PORT_W, "/receipts")
+        check("cooling never re-submits to the witness (receipts unchanged)",
+              sum(1 for i in wl["items"] if i["batch_id"] == cb)
+              == len(cold_files))
+
+        # 12.4 later uploads still accepted and stay HOT; never auto-cooled.
+        later = b"later,upload\n"
+        s, r = upload(PORT_A, cb, "later.csv", later)
+        check("post-cooling upload accepted and stays hot",
+              s == 200 and r["storage"] == "hot")
+        check("later hot original kept on disk",
+              (hot_dir / "later.csv").is_file())
+        s, dl = req("GET", PORT_A, f"/api/batches/{cb}/download/later.csv")
+        check("hot later file downloadable", s == 200 and dl == later)
+
+        # 12.5 repeated cooling KEEPS the original frozen manifest.
+        s, r = req("POST", PORT_A, f"/api/batches/{cb}/cold")
+        check("re-cooling re-queues keeping original manifest",
+              s == 200 and sorted(m["filename"] for m in r["job"]["manifest"])
+              == sorted(cold_files))
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            s, job = req("GET", PORT_A, f"/api/batches/{cb}/cold")
+            if job["job"]["state"] == "completed":
+                break
+            time.sleep(0.2)
+        check("re-cooling completes without touching the later hot file",
+              job["job"]["state"] == "completed"
+              and (hot_dir / "later.csv").is_file())
+        with _zipfile.ZipFile(pkg) as zf:
+            check("rebuilt package still contains only the frozen members",
+                  sorted(zf.namelist()) == sorted(cold_files))
+
+        # 12.6 slow cooling never blocks same-batch status / other uploads.
+        slow_b = "BATCH-SLOW-COLD"
+        for i in range(3):
+            upload(PORT_A, slow_b, f"s{i}.csv", f"slow-{i}\n".encode())
+        req("POST", PORT_A, f"/api/batches/{slow_b}/cold")
+        t0 = time.time()
+        s, _ = req("GET", PORT_A, f"/api/batches/{slow_b}")
+        status_ms = (time.time() - t0) * 1000
+        check("status query fast while cooling is in progress",
+              s == 200 and status_ms < 1500, f"{status_ms:.0f}ms")
+        s, r = upload(PORT_A, "BATCH-PARALLEL", "p.csv", b"parallel\n")
+        check("upload to another batch unaffected by slow cooling",
+              s == 200 and r["result"] == "registered")
+
+        # 12.7 independent verification recomputes cold AND hot originals.
+        s, report = req("GET", PORT_A, "/api/verify")
+        cold_rows = [f for b in report["batches"] if b["batch_id"] == cb
+                     for f in b["files"]]
+        check("verify re-hashes cold members from the ZIP (source=cold)",
+              report["passed"] is True
+              and all(f["local"]["present"] and f["local"]["source"] == "cold"
+                      for f in cold_rows if f["filename"] in cold_files))
+
+        # 12.8 damaged package is reported, not masked by a hot leftover.
+        good = pkg.read_bytes()
+        # leave a residual hot copy for one member, then corrupt the package
+        (hot_dir).mkdir(parents=True, exist_ok=True)
+        (hot_dir / "a.csv").write_bytes(cold_files["a.csv"])
+        pkg.write_bytes(good[: len(good) // 2])  # truncate central directory
+        s, report = req("GET", PORT_A, "/api/verify")
+        b1 = next(b for b in report["batches"] if b["batch_id"] == cb)
+        ptypes = {p["type"] for p in b1.get("package_problems", [])}
+        check("damaged cold package flagged despite hot leftover",
+              report["passed"] is False
+              and "cold_package_damaged" in ptypes, str(ptypes))
+        s, _ = req("GET", PORT_A, f"/api/batches/{cb}/download/b.csv")
+        check("cold download refused while package damaged", s == 503)
+        (hot_dir / "a.csv").unlink()
+
+        # 12.9 missing package is flagged.
+        pkg.unlink()
+        s, report = req("GET", PORT_A, "/api/verify")
+        b1 = next(b for b in report["batches"] if b["batch_id"] == cb)
+        ftypes = {p["type"] for f in b1["files"] for p in f["problems"]}
+        check("missing cold package flagged as cold_package_missing",
+              report["passed"] is False
+              and "cold_package_missing" in ftypes, str(ftypes))
+
+        # 12.10 undeclared (un-witnessed) member inside the package is found.
+        with _zipfile.ZipFile(pkg, "w", _zipfile.ZIP_DEFLATED) as zf:
+            for n, d in cold_files.items():
+                zf.writestr(n, d)
+            zf.writestr("UNWITNESSED.csv", b"not,on,witness,list\n")
+        s, report = req("GET", PORT_A, "/api/verify")
+        b1 = next(b for b in report["batches"] if b["batch_id"] == cb)
+        ptypes = {p["type"] for p in b1.get("package_problems", [])}
+        check("undeclared cold member reported as anomaly",
+              report["passed"] is False
+              and "cold_undeclared_member" in ptypes, str(ptypes))
+
+        # 12.11 catalog-omitted cold member is still located in the package.
+        import sqlite3 as _sqlite3
+        db_path = h.adata / f"archive-{PORT_A}.db"
+        conn = _sqlite3.connect(db_path)
+        conn.execute("DELETE FROM files WHERE batch_id=? AND filename=?",
+                     (cb, "c.csv"))
+        conn.commit()
+        conn.close()
+        s, report = req("GET", PORT_A, "/api/verify")
+        b1 = next(b for b in report["batches"] if b["batch_id"] == cb)
+        fc = next(f for f in b1["files"] if f["filename"] == "c.csv")
+        check("catalog-missing cold member still found in package",
+              any(p["type"] == "catalog_missing" for p in fc["problems"])
+              and fc["local"]["present"] is True
+              and fc["local"]["source"] == "cold")
+        # Restore the catalog row (reconcile reuses the witness receipt) so
+        # the final post-crash verification runs against a clean catalog.
+        req("POST", PORT_A, "/api/reconcile")
+
+        # Restore a clean, manifest-exact package for the crash tests below.
+        with _zipfile.ZipFile(pkg, "w", _zipfile.ZIP_DEFLATED) as zf:
+            for n, d in cold_files.items():
+                zf.writestr(n, d)
+
+        # 12.12 crash mid-cooling -> restart resumes, no half package exposed.
+        # Wait until every earlier job has settled so the marker can only
+        # fire inside the crash batch's own worker run.
+        settle_deadline = time.time() + 15
+        active_states = ("queued", "compressing", "verifying",
+                         "switching", "cleaning")
+        while time.time() < settle_deadline:
+            s, all_jobs = req("GET", PORT_A, "/api/cold-jobs")
+            if not any(j["state"] in active_states for j in all_jobs["jobs"]):
+                break
+            time.sleep(0.2)
+        crash_b = "BATCH-COLD-CRASH"
+        crash_data = {f"k{i}.csv": f"crash-{i}\n".encode() for i in range(3)}
+        for n, d in crash_data.items():
+            upload(PORT_A, crash_b, n, d)
+        # Arm the persistent marker; the worker exits at its first crash
+        # point (after building, before publishing the package).
+        marker.touch()
+        req("POST", PORT_A, f"/api/batches/{crash_b}/cold")
+        time.sleep(2.0)  # worker hits the marker and os._exit(1)
+        check("archive exits when the cold crash marker fires",
+              wait_down(PORT_A, 10))
+        check("hot originals survive the cooling crash, readable",
+              all((h.adata / f"originals-{PORT_A}" / crash_b / n).is_file()
+                  for n in crash_data))
+        check("no package is published before the crash point",
+              not (cold_root / f"{crash_b}.zip").exists())
+        # Restart WITHOUT the marker: the job must resume and finish.
+        marker.unlink(missing_ok=True)
+        h.start_archive()  # same volume, no step sleep, no crash marker
+        check("archive restarts and resumes cooling", wait_port(PORT_A))
+        check("stale .tmp packages are purged on startup",
+              not list(cold_root.glob(".*.tmp")))
+        deadline = time.time() + 20
+        job = {}
+        while time.time() < deadline:
+            s, job = req("GET", PORT_A, f"/api/batches/{crash_b}/cold")
+            if job["job"]["state"] == "completed":
+                break
+            time.sleep(0.3)
+        check("crashed cooling job completes after restart",
+              job.get("job", {}).get("state") == "completed",
+              str(job))
+        check("post-crash hot files cleaned and cold bytes exact",
+              not (h.adata / f"originals-{PORT_A}" / crash_b).exists()
+              and all(req("GET", PORT_A,
+                          f"/api/batches/{crash_b}/download/{n}")[1] == d
+                      for n, d in crash_data.items()))
+        s, report = req("GET", PORT_A, "/api/verify")
+        check("full verification passes after crash recovery",
+              s == 200 and report["passed"] is True)
 
     finally:
         h.cleanup()

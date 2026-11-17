@@ -79,6 +79,42 @@ curl -sS -o /dev/null -w "download HTTP %{http_code} (expected 409)\n" \
   "$ARCHIVE_URL/api/batches/$BATCH/download/readings.csv"
 set -e
 
+line "10. batch cooling: freeze the list, zip the originals, clean hot files"
+COLD_BATCH="BATCH-COLD-$(date +%H%M%S)"
+for n in alpha beta gamma; do
+  printf 'sensor,value\n%s,%.2f\n' "$n" "$RANDOM" > "$TMP/$n.csv"
+  curl -fsS -X POST "$ARCHIVE_URL/api/batches/$COLD_BATCH/files" \
+       -F filename="$n.csv" -F "file=@$TMP/$n.csv" >/dev/null
+done
+curl -fsS -X POST "$ARCHIVE_URL/api/batches/$COLD_BATCH/cold" \
+  | python3 -c "import json,sys; j=json.load(sys.stdin)['job']; print('queued manifest:', [m['filename'] for m in j['manifest']])"
+for _ in $(seq 1 30); do
+  state=$(curl -fsS "$ARCHIVE_URL/api/batches/$COLD_BATCH/cold" \
+          | python3 -c "import json,sys; print(json.load(sys.stdin)['job']['state'])")
+  [ "$state" = "completed" ] && break
+  [ "$state" = "failed" ] && { echo "cooling FAILED"; exit 1; }
+  sleep 1
+done
+echo "cooling final state: $state"
+curl -fsS "$ARCHIVE_URL/api/batches/$COLD_BATCH" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['status']=='complete' and d['cold_count']==3, d
+print('catalog storage:', [(f['filename'],f['storage']) for f in d['files']])"
+docker exec research-archive sh -c \
+  "ls -la /data/cold/$COLD_BATCH.zip && test ! -e /data/originals/$COLD_BATCH" \
+  && echo "cold package persisted; hot originals cleaned"
+# Single-member read out of the ZIP, byte-identical to the original upload.
+curl -fsS "$ARCHIVE_URL/api/batches/$COLD_BATCH/download/alpha.csv" -o "$TMP/alpha.dl"
+cmp "$TMP/alpha.csv" "$TMP/alpha.dl" && echo "cold download byte-identical"
+
+line "11. verification covers cold packages and still passes"
+curl -fsS "$ARCHIVE_URL/api/verify" | python3 -c "
+import json,sys
+r=json.load(sys.stdin)
+assert r['passed'] is True, r
+print('verification passed across hot + cold originals')"
+
 line "DEMO COMPLETE"
 echo "Open the web UI: $ARCHIVE_URL  (batch page: $ARCHIVE_URL/batches/$BATCH)"
 echo "Witness receipt list: $WITNESS_URL/receipts"

@@ -18,20 +18,41 @@
   <h2>本地批次</h2>
   {% if batches %}
   <table>
-    <tr><th>批号</th><th>文件数</th><th>已登记</th><th>待核</th><th>首次出现</th><th></th></tr>
+    <tr><th>批号</th><th>文件数</th><th>已登记</th><th>待核</th><th>冷件</th><th>首次出现</th><th></th></tr>
     {% for b in batches %}
     <tr>
       <td><a href="/batches/{{ b.batch_id }}">{{ b.batch_id }}</a></td>
       <td>{{ b.file_count }}</td>
       <td>{{ b.registered_count }}</td>
       <td>{{ b.pending_count }}</td>
+      <td>{{ b.cold_count }}</td>
       <td class="muted">{{ b.first_seen }}</td>
-      <td><a href="/batches/{{ b.batch_id }}">详情/下载</a></td>
+      <td><a href="/batches/{{ b.batch_id }}">详情/转冷/下载</a></td>
     </tr>
     {% endfor %}
   </table>
   {% else %}
   <p class="muted">暂无批次。</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>转冷任务（压缩入 ZIP 冷包）</h2>
+  {% if jobs %}
+  <table>
+    <tr><th>批号</th><th>状态</th><th>进度</th><th>冻结名单</th><th>失败原因</th></tr>
+    {% for j in jobs %}
+    <tr>
+      <td><a href="/batches/{{ j.batch_id }}">{{ j.batch_id }}</a></td>
+      <td>{{ j.state }}</td>
+      <td>{{ j.processed }}/{{ j.total }}</td>
+      <td class="mono">{% for m in j.manifest %}{{ m.filename }} {% endfor %}</td>
+      <td class="bad">{{ j.last_error or '' }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">暂无转冷任务。进入任一批次页可发起转冷、查看进度与失败原因。</p>
   {% endif %}
 </div>
 

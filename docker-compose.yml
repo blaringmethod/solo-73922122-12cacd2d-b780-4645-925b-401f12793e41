@@ -36,8 +36,10 @@ services:
     environment:
       ARCHIVE_DB: /data/archive.db
       ARCHIVE_STORAGE: /data/originals
+      ARCHIVE_COLD_DIR: /data/cold
       ARCHIVE_PUBLIC_KEY: /app/keys/witness_ed25519.pub.pem
       ARCHIVE_CRASH_MARKER: /data/crash_after_witness.flag
+      ARCHIVE_COLD_CRASH_MARKER: /data/crash_during_cooling.flag
       WITNESS_URL: http://witness:8001
       ARCHIVE_MAX_UPLOAD_BYTES: "2097152"
     volumes:
